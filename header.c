@@ -539,6 +539,11 @@ void ci_headers_pack(ci_headers_list_t * h)
 }
 
 
+/*
+ * ヘッダ情報を内部オブジェクトに変換
+ * - ヘッダ行(リクエストライン含む)ごとに h->headers[] へ格納
+ * - 格納する際に行末の CRLF は削る
+ */
 int ci_headers_unpack(ci_headers_list_t * h)
 {
     int len, eoh;
@@ -548,7 +553,7 @@ int ci_headers_unpack(ci_headers_list_t * h)
     if (h->bufused < 2)        /*???????????? */
         return EC_400;
 
-    ebuf = h->buf + h->bufused - 2;
+    ebuf = h->buf + h->bufused - 2;  /* ヘッダ区切りの前まで */
     /* ebuf now must indicate the last \r\n so: */
     if (*ebuf != '\r' && *ebuf != '\n') {      /*Some sites return (this is bug ) a simple '\n' as end of header ..... */
         ci_debug_printf(3,
@@ -569,6 +574,7 @@ int ci_headers_unpack(ci_headers_list_t * h)
             if ((str + 2) >= ebuf
                     || (*(str + 2) != '\t' && *(str + 2) != ' '))
                 eoh = 1;
+        /* \t, ' ' の条件はマルチライン考慮 */
         } else if (*str == '\n' && *(str + 1) != '\t' && *(str + 1) != ' ') {
             /*handle the case that headers seperated with a '\n' only */
             eoh = 1;
@@ -576,6 +582,7 @@ int ci_headers_unpack(ci_headers_list_t * h)
             *str = ' ';
 
         if (eoh) {
+            /* 各ヘッダ行末尾のCRLFの代わりに \0 を置く */
             *str = '\0';
             if (h->size <= h->used) {        /*  Resize the headers index space ........ */
                 len = h->size + HEADERSTARTSIZE;

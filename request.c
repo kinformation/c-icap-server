@@ -82,6 +82,7 @@ void request_stats_init()
     STAT_BODY_BYTES_OUT = ci_stat_entry_register("BODY BYTES OUT", STAT_KBS_T, "General");
 }
 
+/* ICAPリクエスト受信待ち */
 static int wait_for_data(ci_connection_t *conn, int secs, int what_wait)
 {
     int wait_status;
@@ -104,6 +105,10 @@ static int wait_for_data(ci_connection_t *conn, int secs, int what_wait)
     return wait_status;
 }
 
+/*
+  リクエストオブジェクトの生成
+  リクエストの都度呼ばれるわけではない？
+*/
 ci_request_t *newrequest(ci_connection_t * connection)
 {
     ci_request_t *req;
@@ -111,11 +116,27 @@ ci_request_t *newrequest(ci_connection_t * connection)
     int len;
     ci_connection_t *conn;
 
+    /* コネクションオブジェクト生成 */
     conn = (ci_connection_t *) malloc(sizeof(ci_connection_t));
+    /* ★ NULL チェック追加 */
+    if (conn == NULL) {
+        ci_debug_printf(1,
+                        "Server Error: Error allocating memory \n");
+        return NULL;
+    }
+
     assert(conn);
     ci_copy_connection(conn, connection);
+    /* req の malloc 失敗でNULLリターン */
     req = ci_request_alloc(conn);
+    /* ★ NULL チェック追加 */
+    if (req == NULL) {
+        ci_debug_printf(1,
+                        "Server Error: Error allocating memory \n");
+        return NULL;
+    }
 
+    /* acl 検査 */
     if ((access = access_check_client(req)) == CI_ACCESS_DENY) { /*Check for client access */
         len = strlen(FORBITTEN_STR);
         ci_connection_write(connection, FORBITTEN_STR, len, TIMEOUT);
@@ -129,14 +150,17 @@ ci_request_t *newrequest(ci_connection_t * connection)
 }
 
 
+/* リクエストの再利用 */
 int recycle_request(ci_request_t * req, ci_connection_t * connection)
 {
     int access;
     int len;
 
+    /* req 初期化 */
     ci_request_reset(req);
     ci_copy_connection(req->connection, connection);
 
+    /* acl 検査 */
     if ((access = access_check_client(req)) == CI_ACCESS_DENY) { /*Check for client access */
         len = strlen(FORBITTEN_STR);
         ci_connection_write(connection, FORBITTEN_STR, len, TIMEOUT);
@@ -146,20 +170,25 @@ int recycle_request(ci_request_t * req, ci_connection_t * connection)
     return 1;
 }
 
+/* Keep-Alive 処理 */
 int keepalive_request(ci_request_t *req)
 {
     /* Preserve extra read bytes*/
+    /* 溢れたリクエストデータの退避？ */
     char *pstrblock = req->pstrblock_read;
     int pstrblock_len = req->pstrblock_read_len;
     // Just reset without change or free memory
     ci_request_reset(req);
     if (PIPELINING) {
+        /* パイプライン有効なら、溢れたリクエストデータを次リクエストに引継ぐ */
         req->pstrblock_read = pstrblock;
         req->pstrblock_read_len = pstrblock_len;
     }
 
     if (req->pstrblock_read && req->pstrblock_read_len > 0)
         return 1;
+
+    /* ICAPリクエスト待ち合わせ */
     return wait_for_data(req->connection, KEEPALIVE_TIMEOUT, ci_wait_for_read);
 }
 
@@ -188,6 +217,13 @@ static int icap_header_check_realloc(char **buf, int *size, int used, int mustad
 }
 
 
+/*
+ * ICAPリクエストヘッダの受信処理
+ *
+ * ci_request_t       *req      : リクエストオブジェクト
+ * ci_headers_list_t  *h        : バッファリスト
+ * int                 timeout  : 接続タイムアウト
+ */
 static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int timeout)
 {
     int bytes, request_status = EC_100, i, eoh = 0, startsearch = 0, readed = 0;
@@ -199,6 +235,7 @@ static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int ti
     readed = 0;
     bytes = 0;
 
+    /* パイプライン有効かつ溢れデータありなら、受信データの前に溢れデータをつける */
     if (PIPELINING && req->pstrblock_read && req->pstrblock_read_len > 0) {
         if ((request_status =
                     icap_header_check_realloc(&(h->buf), &(h->bufsize), req->pstrblock_read_len,
@@ -216,10 +253,16 @@ static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int ti
 
     do {
 
+        /* 溢れデータがあれば、先に溢れデータを処理してからリクエストを待つ */
+
         if (!dataPrefetch) {
             if ((wait_status = wait_for_data(req->connection, timeout, ci_wait_for_read)) < 0)
-                return EC_408;
+                return EC_408;  /* 接続待ちエラー */
 
+            /*
+             * read() でリクエスト受信
+             * 非SSL通信なら bytes == 0 にはならない
+             */
             bytes = ci_connection_read_nonblock(req->connection, buf_end, ICAP_HEADER_READSIZE);
             if (bytes < 0)
                 return EC_408;
@@ -232,8 +275,10 @@ static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int ti
         } else
             dataPrefetch = 0;
 
+        /* ICAPヘッダの区切り位置を検査 */
         for (i = startsearch; i < bytes - 3; i++) {   /*search for end of header.... */
             if (strncmp(buf_end + i, "\r\n\r\n", 4) == 0) {
+                /* buf_end をICAPヘッダの区切り手前まで進める */
                 buf_end = buf_end + i + 2;
                 eoh = 1;
                 break;
@@ -247,17 +292,27 @@ static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int ti
                                               ICAP_HEADER_READSIZE)) != EC_100)
             break;
         buf_end = h->buf + readed;
+
+        /* ICAPヘッダ区切り検査開始位置が受信ヘッダの先頭になるよう調整 */
         if (startsearch > -3)
             startsearch = (readed > 3 ? -3 : -readed);       /*Including the last 3 char ellements ....... */
     } while (1);
 
     h->bufused = buf_end - h->buf;     /* -1 ; */
+    /* +2 は、ヘッダ区切り(\r\n)分 */
     req->pstrblock_read = buf_end + 2; /*after the \r\n\r\n. We keep the first \r\n and the other dropped.... */
     req->pstrblock_read_len = readed - h->bufused - 2; /*the 2 of the 4 characters \r\n\r\n and the '\0' character */
     req->request_bytes_in = h->bufused + 2; /*This is include the "\r\n\r\n" sequence*/
     return request_status;
 }
 
+/*
+ * カプセル化ヘッダ（HTTPリクエストヘッダ or HTTPレスポンスヘッダ）受信処理
+ *
+ * ci_request_t       *req  : リクエストオブジェクト
+ * ci_headers_list_t  *h    : バッファリスト
+ * int                 size : Encapsulatedヘッダで通知されたカプセル化ヘッダサイズ
+ */
 static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int size)
 {
     int bytes = 0, remains, readed = 0;
@@ -267,12 +322,14 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
         return EC_500;
     buf_end = h->buf;
 
+    /* 溢れデータのセット */
     if (req->pstrblock_read_len > 0) {
         readed =
             (size > req->pstrblock_read_len ? req->pstrblock_read_len : size);
         memcpy(h->buf, req->pstrblock_read, readed);
         buf_end = h->buf + readed;
         if (size <= req->pstrblock_read_len) {        /*We have readed all this header....... */
+            /* カプセル化ヘッダを全て受信済み */
             req->pstrblock_read = (req->pstrblock_read) + readed;
             req->pstrblock_read_len = (req->pstrblock_read_len) - readed;
         } else {
@@ -283,8 +340,10 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
 
     remains = size - readed;
     while (remains > 0) {
+        /* クライアントからのデータ受信待ち */
         if (wait_for_data(req->connection, TIMEOUT, ci_wait_for_read) < 0)
             return CI_ERROR;
+        /* 最大で残サイズ分の受信データを取得 */
         if ((bytes = ci_connection_read_nonblock(req->connection, buf_end, remains)) < 0)
             return CI_ERROR;
         remains -= bytes;
@@ -292,6 +351,7 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
         req->bytes_in += bytes;
     }
 
+    /* カプセル化ヘッダ区切り位置を検査 */
     h->bufused = buf_end - h->buf;     // -1 ;
     if (strncmp(buf_end - 4, "\r\n\r\n", 4) == 0) {
         h->bufused -= 2;      /*eat the last 2 bytes of "\r\n\r\n" */
@@ -308,6 +368,9 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
     return EC_100;
 }
 
+/*
+ * ICAP メソッド取得
+ */
 static int get_method(char *buf, char **end)
 {
     if (!strncmp(buf, "OPTIONS", 7)) {
@@ -325,6 +388,12 @@ static int get_method(char *buf, char **end)
     }
 }
 
+/*
+ * ICAPリクエストライン解析処理
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ * char          *buf   : リクエストラインバッファ
+ */
 static int parse_request(ci_request_t * req, char *buf)
 {
     char *start, *end;
@@ -333,12 +402,18 @@ static int parse_request(ci_request_t * req, char *buf)
     ci_service_module_t *service = NULL;
     service_alias_t *salias = NULL;
 
+    /* ICAPメソッド検査 */
     if ((req->type = get_method(buf, &end)) < 0)
         return EC_400;
 
+    /*
+     * ICAPメソッド後のスペース分 end を進める
+     * ICAPメソッド後の複数スペースを許容している
+     */
     while (*end == ' ') end++;
     start = end;
 
+    /* URL検査 */
     if (strncasecmp(start, "icap://", 7) == 0)
         start = start + 7;
     else if (strncasecmp(start, "icaps://", 8) == 0)
@@ -346,6 +421,7 @@ static int parse_request(ci_request_t * req, char *buf)
     else
         return EC_400;
 
+    /* ホスト名の切り出し */
     len = strcspn(start, "/ ");
     end = start + len;
     servnamelen =
@@ -353,6 +429,7 @@ static int parse_request(ci_request_t * req, char *buf)
     memcpy(req->req_server, start, servnamelen);
     req->req_server[servnamelen] = '\0';
     if (*end == '/') { /*we are expecting service name*/
+        /* サービス名検査 */
         start = ++end;
         while (*end && *end != ' ' && *end != '?')
             end++;
@@ -366,8 +443,10 @@ static int parse_request(ci_request_t * req, char *buf)
         }
 
         if (*end == '?') {     /*args */
+            /* クエリパラメタ検査 */
             start = ++end;
             if ((end = strchr(start, ' ')) != NULL) {
+                /* この時点での req->args には設定で定義されたパラメタが入っている？ */
                 args_len = strlen(req->args);
                 len = end - start;
                 if (args_len && len) {
@@ -383,29 +462,54 @@ static int parse_request(ci_request_t * req, char *buf)
         }      /*end of parsing args */
     }
 
+    /*
+     * URL後のスペース分 end を進める
+     * URL後の複数スペースを許容している
+     */
     while (*end == ' ')
         end++;
     start = end;
 
+    /*
+     * ICAPバージョン検査
+     *
+     * ICAPバージョン部は <数値>.<数値> の形式であれば正常扱いとなる
+     * オリジナルでは <数値>.<数値> の後に任意文字列が存在しても正常となる
+     * Ex. ICAP/1.0aaaa
+     */
     vminor = vmajor = -1;
     if (strncmp(start, "ICAP/", 5) == 0) {
         start += 5;
+        /*
+         * 変換対象の文字が数字でなければ strtol は 0 を返す
+         * end には変換不可能な文字の最初の位置が格納される
+         */
         vmajor = strtol(start, &end, 10);
         if (vmajor > 0 && *end == '.') {
             start = end + 1;
             vminor = strtol(start, &end, 10);
             if (end == start) /*no chars parsed*/
                 vminor = -1;
+            /* ★ マイナーバージョンの後に文字列がないことの検査を追加 */
+            if (*end) {
+                vminor = -1;
+            }
+
         }
     }
 
     if (vminor == -1 || vmajor < 1)
         return EC_400;
 
+    /*
+     * URLからサービス名取得できなければ既定サービス名を設定
+     * 既定サービス名は DefaultService で設定する（未設定時はNULL）
+     */
     if (req->service[0] == '\0' && DEFAULT_SERVICE) { /*No service name defined*/
         strncpy(req->service, DEFAULT_SERVICE, MAX_SERVICE_NAME);
     }
 
+    /* 有効なサービス名か検査 */
     if (req->service[0] != '\0') {
         if (!(service = find_service(req->service))) { /*else search for an alias */
             if ((salias = find_service_alias(req->service))) {
@@ -420,6 +524,7 @@ static int parse_request(ci_request_t * req, char *buf)
     if (!req->current_service_mod)
         return EC_404; /*Service not found*/
 
+    /* リクエストメソッドが指定サービスで有効なメソッドか検査 */
     if (!ci_method_support
             (req->current_service_mod->mod_type, req->type)
             && req->type != ICAP_OPTIONS) {
@@ -429,8 +534,21 @@ static int parse_request(ci_request_t * req, char *buf)
     return EC_100;
 }
 
+/*
+ * ICAPリクエスト Encapsulatedヘッダ書式検査
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ */
 static int check_request(ci_request_t *req)
 {
+
+    /*
+     * req->entities には Encapsulated ヘッダの解析結果が格納される
+     * ex) Encapsulated: req-hdr=0, req-body=147 の場合、
+     *   req->entities[0]  ->  req-hdr=0 の解析内容
+     *   req->entities[1]  ->  req-body=147 の解析内容
+     */
+
     /*Check encapsulated header*/
     if (req->entities[0] == NULL && req->type != ICAP_OPTIONS) /*No encapsulated header*/
         return EC_400;
@@ -442,6 +560,18 @@ static int check_request(ci_request_t *req)
                     req->entities[2] ? req->entities[2]->type : -1,
                     req->entities[3] ? req->entities[3]->type : -1
                    );
+
+    /* Encapsulated ヘッダ解析結果の検査 */
+
+    /*
+     * REQMOD で正常とするパターンは以下
+     * - req-hdr=xxx, req-body=xxx
+     * - req-hdr=xxx, null-body=xxx
+     * - req-body=xxx
+     *
+     * 以下は、RFCでは許容されるが、c-icapでは許容していない
+     * - null-body=xxx
+     */
     if (req->type == ICAP_REQMOD) {
         if (req->entities[2] != NULL)
             return EC_400;
@@ -456,6 +586,22 @@ static int check_request(ci_request_t *req)
                 return EC_400;
 
         }
+
+    /*
+     * RESPMOD で正常とするパターンは以下
+     * - [reqhdr] [reshdr] resbody
+     * - req-hdr=xxx, res-hdr=xxx, res-body=xxx
+     * - req-hdr=xxx, res-hdr=xxx, null-body=xxx
+     * - req-hdr=xxx, res-body=xxx
+     * - req-hdr=xxx, null-body=xxx
+     * - res-hdr=xxx, res-body=xxx
+     * - res-hdr=xxx, null-body=xxx
+     * - res-body=xxx
+
+     *
+     * 以下は、RFCでは許容されるが、c-icapでは許容していない
+     * - null-body=xxx
+     */
     } else if (req->type == ICAP_RESPMOD) {
         if (req->entities[3] != NULL)
             return EC_400;
@@ -482,6 +628,11 @@ static int check_request(ci_request_t *req)
     return EC_100;
 }
 
+/*
+ * ICAPリクエストヘッダ解析処理
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ */
 static int parse_header(ci_request_t * req)
 {
     int i, request_status = EC_100, result;
@@ -489,15 +640,19 @@ static int parse_header(ci_request_t * req)
     char *val;
 
     h = req->request_header;
+    /* ICAPリクエストヘッダ受信 */
     if ((request_status = ci_read_icap_header(req, h, TIMEOUT)) != EC_100)
         return request_status;
 
+    /* ヘッダ情報を内部オブジェクト(h->headers)に格納 */
     if ((request_status = ci_headers_unpack(h)) != EC_100)
         return request_status;
 
+    /* ICAPリクエストライン解析処理 */
     if ((request_status = parse_request(req, h->headers[0])) != EC_100)
         return request_status;
 
+    /* ICAPヘッダ解析 */
     for (i = 1; i < h->used && request_status == EC_100; i++) {
         if (strncasecmp("Preview:", h->headers[i], 8) == 0) {
             val = h->headers[i] + 8;
@@ -506,8 +661,13 @@ static int parse_header(ci_request_t * req)
             result = strtol(val, NULL, 10);
             if (errno != EINVAL && errno != ERANGE) {
                 req->preview = result;
-                if (result >= 0)
-                    ci_buf_reset_size(&(req->preview_data), result + 64);
+                if (result >= 0) {
+                    /* ★ メモリ確保失敗時のエラーハンドル追加 */
+                    // ci_buf_reset_size(&(req->preview_data), result + 64);
+                    if (ci_buf_reset_size(&(req->preview_data), result + 64) == 0) {
+                        request_status = EC_500;
+                    }
+                }
             }
         } else if (strncasecmp("Encapsulated:", h->headers[i], 13) == 0)
             request_status = process_encapsulated(req, h->headers[i]);
@@ -533,24 +693,33 @@ static int parse_header(ci_request_t * req)
 }
 
 
+/*
+ * カプセル化ヘッダ(HTTPリクエストヘッダ or HTTPレスポンスヘッダ)解析処理
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ */
 static int parse_encaps_headers(ci_request_t * req)
 {
     int size, i, request_status = 0;
     ci_encaps_entity_t *e = NULL;
     for (i = 0; (e = req->entities[i]) != NULL; i++) {
+        /* 以降はボディデータ */
         if (e->type > ICAP_RES_HDR)   //res_body,req_body or opt_body so the end of the headers.....process_encapsulated
             return EC_100;
 
+        /* カプセル化ヘッダの後ろには最低限ボディエンティティを期待する */
         if (req->entities[i + 1] == NULL)
             return EC_400;
 
         size = req->entities[i + 1]->start - e->start;
 
+        /* Encapsulated ヘッダで指定されたバイト分のみリクエスト受信 */
         if ((request_status =
                     read_encaps_header(req, (ci_headers_list_t *) e->entity,
                                        size)) != EC_100)
             return request_status;
 
+        /* ヘッダ情報を内部オブジェクト(h->headers)に格納 */
         if ((request_status =
                     ci_headers_unpack((ci_headers_list_t *) e->entity)) != EC_100)
             return request_status;
@@ -571,6 +740,7 @@ static int read_preview_data(ci_request_t * req)
     req->chunk_bytes_read = 0;
     req->write_to_module_pending = 0;
 
+    /* ボディデータ受信 */
     if (req->pstrblock_read_len == 0) {
         if (wait_for_data(req->connection, TIMEOUT, ci_wait_for_read) < 0)
             return CI_ERROR;
@@ -579,6 +749,8 @@ static int read_preview_data(ci_request_t * req)
             return CI_ERROR;
     }
 
+    /* チャンクデータ解析 */
+    /* 溢れデータがあれば先に解析して追加分のボディデータを受信 */
     do {
         do {
             if ((ret = parse_chunk_data(req, &wdata)) == CI_ERROR) {
@@ -588,12 +760,14 @@ static int read_preview_data(ci_request_t * req)
                                 req->chunk_bytes_read, req->pstrblock_read);
                 return CI_ERROR;
             }
+            /* req->preview_data に受信データを格納 */
             if (ci_buf_write
                     (&(req->preview_data), wdata,
                      req->write_to_module_pending) < 0)
                 return CI_ERROR;
             req->write_to_module_pending = 0;
 
+            /* Previewで最後まで受信しきった */
             if (ret == CI_EOF) {
                 req->pstrblock_read = NULL;
                 req->pstrblock_read_len = 0;
@@ -603,6 +777,7 @@ static int read_preview_data(ci_request_t * req)
             }
         } while (ret != CI_NEEDS_MORE);
 
+        /* ボディデータ受信 */
         if (wait_for_data(req->connection, TIMEOUT, ci_wait_for_read) < 0)
             return CI_ERROR;
         if (net_data_read(req) == CI_ERROR)
@@ -612,6 +787,13 @@ static int read_preview_data(ci_request_t * req)
     return CI_ERROR;
 }
 
+/*
+ * レスポンスラインのみのICAPレスポンス生成
+ * エラー時のレスポンス用？
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ * int            ec    : エラーコード
+ */
 static void ec_responce_simple(ci_request_t * req, int ec)
 {
     char buf[256];
@@ -625,6 +807,12 @@ static void ec_responce_simple(ci_request_t * req, int ec)
     req->return_code = ec;
 }
 
+/*
+ * ICAPレスポンス生成
+ *
+ * ci_request_t  *req   : リクエストオブジェクト
+ * int            ec    : エラーコード
+ */
 static int ec_responce(ci_request_t * req, int ec)
 {
     char buf[256];
@@ -638,8 +826,11 @@ static int ec_responce(ci_request_t * req, int ec)
         allow204to200OK = 1;
         ec = EC_200;
     }
+
+    /* レスポンスライン生成 */
     snprintf(buf, 256, "ICAP/1.0 %d %s",
              ci_error_code(ec), ci_error_code_string(ec));
+    /* レスポンスラインを応答ヘッダオブジェクトに登録 */
     ci_headers_add(req->response_header, buf);
     ci_headers_add(req->response_header, "Server: C-ICAP/" VERSION);
     if (req->keepalive)
@@ -664,9 +855,12 @@ static int ec_responce(ci_request_t * req, int ec)
     /*
       TODO: Release req->entities (ci_request_release_entity())
      */
+
+    /* 応答ヘッダオブジェクトから応答ヘッダデータ生成 */
     ci_headers_pack(req->response_header);
     req->return_code = ec;
 
+    /* ICAPレスポンスヘッダをクライアントへ送信 */
     len = ci_connection_write(req->connection,
                               req->response_header->buf, req->response_header->bufused,
                               TIMEOUT);
@@ -723,6 +917,12 @@ static int mk_responce_header(ci_request_t * req)
               current_service_mod->mod_short_descr : req->current_service_mod->
               mod_name));
     /*Here we must append it to an existsing Via header not just add a new header */
+    /*
+     * ICAPリクエストされたHTTPヘッダにViaヘッダが存在する場合
+     * そのViaヘッダ値にカンマ繋ぎで上記Via値を追加してICAPレスポンスとすべきであるが、
+     * 上記処理では単純にヘッダ追加している（Viaヘッダが重複してICAPクライアントへ応答される）
+     */
+
     if (req->type == ICAP_RESPMOD) {
         ci_http_response_add_header(req, buf);
     } else if (req->type == ICAP_REQMOD) {
