@@ -968,7 +968,7 @@ static int send_current_block_data(ci_request_t * req)
     return req->remain_send_block_bytes;
 }
 
-
+/* いつ呼ばれる？ */
 static int format_body_chunk(ci_request_t * req)
 {
     int def_bytes;
@@ -985,13 +985,16 @@ static int format_body_chunk(ci_request_t * req)
         req->http_bytes_out += req->remain_send_block_bytes;
         req->body_bytes_out += req->remain_send_block_bytes;
 
+        /* チャンクの最大サイズ位置に \r\n を置く */
         wbuf = req->wbuf + EXTRA_CHUNK_SIZE + req->remain_send_block_bytes;
         /*Put the "\r\n" sequence at the end of chunk */
         *(wbuf++) = '\r';
         *wbuf = '\n';
+        /* チャンクサイズ行生成 */
         def_bytes =
             snprintf(tmpbuf, EXTRA_CHUNK_SIZE, "%x\r\n",
                      req->remain_send_block_bytes);
+        /* チャンク行を wbuf に書き込み */
         wbuf = req->wbuf + EXTRA_CHUNK_SIZE - def_bytes;      /*Copy the chunk define in the beggining of chunk ..... */
         memcpy(wbuf, tmpbuf, def_bytes);
         req->pstrblock_responce = wbuf;
@@ -1003,6 +1006,7 @@ static int format_body_chunk(ci_request_t * req)
             req->pstrblock_responce = req->wbuf;
             req->remain_send_block_bytes = def_bytes;
         } else {
+            /* チャンク終端行 */
             strcpy(req->wbuf, "0\r\n\r\n");
             req->pstrblock_responce = req->wbuf;
             req->remain_send_block_bytes = 5;
@@ -1013,7 +1017,7 @@ static int format_body_chunk(ci_request_t * req)
 }
 
 
-
+/* ICAPリクエストのカプセル化ボディ有無を返す */
 static int resp_check_body(ci_request_t * req)
 {
     int i;
@@ -1094,6 +1098,7 @@ static int update_send_status(ci_request_t * req)
     return CI_ERROR;           /*Can not be reached (I thing)...... */
 }
 
+/* ioハンドラ null */
 static int mod_null_io(char *rbuf, int *rlen, char *wbuf, int *wlen, int iseof,
                        ci_request_t *req)
 {
@@ -1104,6 +1109,7 @@ static int mod_null_io(char *rbuf, int *rlen, char *wbuf, int *wlen, int iseof,
     return CI_OK;
 }
 
+/* ioハンドラ echo */
 static int mod_echo_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof,
                        ci_request_t *req)
 {
@@ -1148,6 +1154,11 @@ static int get_send_body(ci_request_t * req, int parse_only)
     /*in the case we did not have preview data and body is small maybe
        the c-icap already read the body with the headers so do not read
        if there are unparsed bytes in pstrblock buffer
+     */
+    /*
+     * プレビューデータではなくボディサイズの小さいICAPリクエストは、
+     * ヘッダと一緒にボディも読み取られるため、pstrblock バッファに
+     * 未解析のデータがある場合は、ICAPリクエストを読み取らないでください
      */
     if (req->pstrblock_read_len == 0)
         action = ci_wait_for_read;
@@ -1353,6 +1364,7 @@ static int send_remaining_response(ci_request_t * req)
     return CI_OK;
 }
 
+/* OPTIONS 応答処理 */
 static void options_responce(ci_request_t * req)
 {
     char buf[MAX_HEADER_SIZE + 1];
@@ -1367,6 +1379,7 @@ static void options_responce(ci_request_t * req)
     head = req->response_header;
     srv_xdata = service_data(req->current_service_mod);
     ci_headers_reset(head);
+    /* サービス個別のOPTIONS処理ハンドラ呼び出し */
     if (run_services_option_handlers(srv_xdata, req) != CI_OK)
         ci_headers_add(head, "ICAP/1.0 500 Server Error");
     else
@@ -1499,17 +1512,20 @@ static void options_responce(ci_request_t * req)
     if (!ci_headers_is_empty(req->xheaders)) {
         ci_headers_addheaders(head, req->xheaders);
     }
+    /* ICAPレスポンスデータ生成 */
     ci_response_pack(req);
 
     req->pstrblock_responce = head->buf;
     req->remain_send_block_bytes = head->bufused;
 
     do {
+        /* 書き込み待機 */
         if ((wait_for_data(req->connection, TIMEOUT, ci_wait_for_write))
                 < 0) {
             ci_debug_printf(3, "Timeout sending data. Ending .......\n");
             return;
         }
+        /* クライアントへレスポンス送信 */
         if (send_current_block_data(req) == CI_ERROR) {
             ci_debug_printf(3, "Error sending data. Ending .....\n");
             return;
@@ -1529,6 +1545,13 @@ static void options_responce(ci_request_t * req)
      inside preview, no need to read more data from the client)
   - CI_ERROR on error
 */
+/*
+ * プレビューデータの読み取りとレスポンス処理
+ * 復帰値
+ * - CI_OK      : プレビュー処理成功
+ * - CI_EOF     : プレビューサイズ内で全ボディ受信
+ * - CI_ERROR   : 処理異常
+ */
 static int do_request_preview(ci_request_t *req)
 {
     int preview_read_status;
@@ -1547,6 +1570,10 @@ static int do_request_preview(ci_request_t *req)
         return CI_ERROR;
     }
 
+    /*
+     * サービス固有のプレビュー処理ハンドラ呼び出し
+     * ハンドラ登録なければ "100 Continue" 応答
+     */
     if (!req->current_service_mod->mod_check_preview_handler) {
         /*We have not a preview data handler. We are responding with "100 Continue"
           assuming that the service needs to process all data.
@@ -1560,6 +1587,7 @@ static int do_request_preview(ci_request_t *req)
                   req->preview_data.buf, req->preview_data.used, req);
     }
 
+    /* 204応答 */
     if (res == CI_MOD_ALLOW204) {
         if (ec_responce(req, EC_204) < 0) {
             req->keepalive = 0; /*close the connection*/
@@ -1587,6 +1615,8 @@ static int do_request_preview(ci_request_t *req)
         return CI_ERROR;
     }
 
+    /* res == CI_MOD_CONTINUE */
+
     if (preview_read_status != CI_EOF)  {
         ec_responce_simple(req, EC_100);     /*if 100 Continue and not "0;ieof"*/
     }
@@ -1602,6 +1632,9 @@ static int do_request_preview(ci_request_t *req)
    Call the preview handler in the case there is not preview request.
 
 */
+/*
+ * サービスがPreview未サポートの時用のハンドラ？
+ */
 static int do_fake_preview(ci_request_t * req)
 {
     int res;
@@ -1729,6 +1762,7 @@ static int do_request(ci_request_t * req)
     ci_service_xdata_t *srv_xdata = NULL;
     int res, preview_status = 0, auth_status;
     int ret_status = CI_OK; /*By default ret_status is CI_OK, on error must set to CI_ERROR*/
+    /* ICAPリクエストヘッダ解析 */
     res = parse_header(req);
     if (res != EC_100) {
         /*if read some data, bad request or Service not found or Server error or what else,
@@ -1742,6 +1776,7 @@ static int do_request(ci_request_t * req)
         return CI_ERROR;
     }
     assert(req->current_service_mod);
+    /* サービスの追加情報取得 */
     srv_xdata = service_data(req->current_service_mod);
     if (!srv_xdata || srv_xdata->status != CI_SERVICE_OK) {
         ci_debug_printf(2, "Service %s not initialized\n", req->current_service_mod->mod_name);
@@ -1750,6 +1785,7 @@ static int do_request(ci_request_t * req)
         return CI_ERROR;
     }
 
+    /* 認証処理 */
     if ((auth_status = access_check_request(req)) == CI_ACCESS_DENY) {
         req->keepalive = 0;
         if (req->auth_required) {
@@ -1762,6 +1798,7 @@ static int do_request(ci_request_t * req)
     }
 
     if (res == EC_100) {
+        /* カプセル化ヘッダ解析 */
         res = parse_encaps_headers(req);
         if (res != EC_100) {
             req->keepalive = 0;
@@ -1787,6 +1824,7 @@ static int do_request(ci_request_t * req)
     case ICAP_REQMOD:
     case ICAP_RESPMOD:
         if (req->preview >= 0) /*we are inside preview*/
+            /* プレビュー処理 */
             preview_status = do_request_preview(req);
         else {
             /* do_fake_preview return CI_OK or CI_ERROR. */
@@ -1855,6 +1893,7 @@ static int do_request(ci_request_t * req)
     return ret_status;
 }
 
+/* リクエスト処理メイン */
 int process_request(ci_request_t * req)
 {
     int res;
