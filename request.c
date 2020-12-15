@@ -1560,7 +1560,7 @@ static int do_request_preview(ci_request_t *req)
     ci_debug_printf(8,"Read preview data if there are and process request\n");
 
     /*read_preview_data returns CI_OK, CI_EOF or CI_ERROR */
-    if (!req->hasbody)
+    if (!req->hasbody)  /* リクエストボディなし */
         preview_read_status = CI_EOF;
     else if ((preview_read_status = read_preview_data(req)) == CI_ERROR) {
         ci_debug_printf(5,
@@ -1599,6 +1599,7 @@ static int do_request_preview(ci_request_t *req)
         return CI_OK;
     }
 
+    /* 206応答 */
     if (res == CI_MOD_ALLOW206 && req->allow206) {
         req->return_code = EC_206;
         ci_debug_printf(5,"Preview handler return 206 response\n");
@@ -1633,7 +1634,7 @@ static int do_request_preview(ci_request_t *req)
 
 */
 /*
- * サービスがPreview未サポートの時用のハンドラ？
+ * ICAPリクエストが非プレビュー時の処理ハンドラ
  */
 static int do_fake_preview(ci_request_t * req)
 {
@@ -1652,11 +1653,13 @@ static int do_fake_preview(ci_request_t * req)
     }
 
     ci_debug_printf(8,"Preview does not supported. Call the preview handler with no preview data.\n");
+    /* サービス固有のプレビュー処理ハンドラ呼び出し
     res = req->current_service_mod->mod_check_preview_handler(NULL, 0, req);
 
     /*We are outside preview. The client should support allow204 outside preview
       to support it.
      */
+    /* サービスとクライアントの両方が204応答サポートの場合 */
     if (res == CI_MOD_ALLOW204 && req->allow204) {
         ci_debug_printf(5,"Preview handler return allow 204 response, and allow204 outside preview supported\n");
         if (ec_responce(req, EC_204) < 0) {
@@ -1675,9 +1678,15 @@ static int do_fake_preview(ci_request_t * req)
         return CI_OK;
     }
 
+    /* サービスのみ204応答サポートの場合 */
     if (res == CI_MOD_ALLOW204) {
         if (req->hasbody) {
             ci_debug_printf(5,"Preview handler return allow 204 response, allow204 outside preview does NOT supported, and body data\n");
+            /*
+             * ICAPリクエストボディあり かつ、
+             *   - FAKE_ALLOW204 設定有効の場合、200応答
+             *   - FAKE_ALLOW204 設定無効の場合、500応答(本関数の最後部の処理)
+             */
             if (FAKE_ALLOW204) {
                 ci_debug_printf(5,"Fake allow204 supported, echo data back\n");
                 req->echo_body = ci_ring_buf_new(32768);
@@ -1692,6 +1701,7 @@ static int do_fake_preview(ci_request_t * req)
         }
     }
 
+    /* サービスとクライアントの両方が206応答サポートの場合 */
     if (res == CI_MOD_ALLOW206 && req->allow204 && req->allow206) {
         ci_debug_printf(5,"Preview handler return allow 204 response, allow204 outside preview and allow206 supported by t");
         req->return_code = EC_206;
@@ -1721,6 +1731,7 @@ static int do_end_of_data(ci_request_t * req)
     if (!req->current_service_mod->mod_end_of_data_handler)
         return CI_OK; /*Nothing to do*/
 
+    /* サービス固有のデータ取得完了ハンドラ呼び出し */
     res = req->current_service_mod->mod_end_of_data_handler(req);
     /*
          while( req->current_service_mod->mod_end_of_data_handler(req)== CI_MOD_NOT_READY){
@@ -1824,10 +1835,12 @@ static int do_request(ci_request_t * req)
     case ICAP_REQMOD:
     case ICAP_RESPMOD:
         if (req->preview >= 0) /*we are inside preview*/
+            /* do_request_preview returns CI_OK, CI_EOF or CI_ERROR */
             /* プレビュー処理 */
             preview_status = do_request_preview(req);
         else {
             /* do_fake_preview return CI_OK or CI_ERROR. */
+            /* 非プレビュー処理 */
             preview_status = do_fake_preview(req);
         }
 
@@ -1860,6 +1873,7 @@ static int do_request(ci_request_t * req)
         }
 
         /*We have received all data from the client. Call the end-of-data service handler and process*/
+        /* データ取得完了処理 */
         ret_status = do_end_of_data(req);
         if (ret_status == CI_ERROR) {
             req->keepalive = 0; /*close the connection*/
@@ -1885,6 +1899,7 @@ static int do_request(ci_request_t * req)
         break;
     }
 
+    /* サービス固有のリクエスト解放ハンドラ呼び出し */
     if (req->current_service_mod->mod_release_request_data
             && req->service_data)
         req->current_service_mod->mod_release_request_data(req->service_data);
@@ -1898,8 +1913,10 @@ int process_request(ci_request_t * req)
 {
     int res;
     ci_service_xdata_t *srv_xdata;
+    /* リクエスト処理 */
     res = do_request(req);
 
+    /* 未処理リクエストデータあり */
     if (req->pstrblock_read_len) {
         ci_debug_printf(5, "There are unparsed data od size %d: \"%.*s\"\n. Move to connection buffer\n", req->pstrblock_read_len, (req->pstrblock_read_len < 64 ? req->pstrblock_read_len : 64), req->pstrblock_read);
     }
@@ -1907,6 +1924,7 @@ int process_request(ci_request_t * req)
     if (res<0 && req->request_header->bufused == 0) /*Did not read anything*/
         return CI_NO_STATUS;
 
+    /* 統計情報更新 */
     if (STATS) {
         if (req->return_code != EC_404 && req->current_service_mod)
             srv_xdata = service_data(req->current_service_mod);
