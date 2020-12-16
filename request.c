@@ -808,10 +808,16 @@ static void ec_responce_simple(ci_request_t * req, int ec)
 }
 
 /*
- * ICAPレスポンス生成
+ * ICAPエラーレスポンス処理
+ * エラー応答や204応答といったICAPヘッダのみの応答処理を行う
  *
- * ci_request_t  *req   : リクエストオブジェクト
- * int            ec    : エラーコード
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *   int            ec  : 応答コード
+ *
+ * 復帰値
+ *   >0 : 応答処理正常(応答サイズ)
+ *   -1 : 応答処理異常
  */
 static int ec_responce(ci_request_t * req, int ec)
 {
@@ -820,18 +826,22 @@ static int ec_responce(ci_request_t * req, int ec)
     int len, allow204to200OK = 0;
     if (req->current_service_mod)
         srv_xdata = service_data(req->current_service_mod);
+
+    /* 応答ヘッダオブジェクト初期化 */
     ci_headers_reset(req->response_header);
 
+    /* 204応答を200応答にする設定の場合 */
     if (ec == EC_204 && ALLOW204_AS_200OK_ZERO_ENCAPS) {
         allow204to200OK = 1;
         ec = EC_200;
     }
 
-    /* レスポンスライン生成 */
+    /* ICAPレスポンスライン */
     snprintf(buf, 256, "ICAP/1.0 %d %s",
              ci_error_code(ec), ci_error_code_string(ec));
-    /* レスポンスラインを応答ヘッダオブジェクトに登録 */
     ci_headers_add(req->response_header, buf);
+
+    /* ICAPレスポンスヘッダ */
     ci_headers_add(req->response_header, "Server: C-ICAP/" VERSION);
     if (req->keepalive)
         ci_headers_add(req->response_header, "Connection: keep-alive");
@@ -856,11 +866,11 @@ static int ec_responce(ci_request_t * req, int ec)
       TODO: Release req->entities (ci_request_release_entity())
      */
 
-    /* 応答ヘッダオブジェクトから応答ヘッダデータ生成 */
+    /* 応答ヘッダオブジェクトから応答データ生成 */
     ci_headers_pack(req->response_header);
     req->return_code = ec;
 
-    /* ICAPレスポンスヘッダをクライアントへ送信 */
+    /* 応答データをクライアントへ送信 */
     len = ci_connection_write(req->connection,
                               req->response_header->buf, req->response_header->bufused,
                               TIMEOUT);
@@ -1768,11 +1778,22 @@ static int do_end_of_data(ci_request_t * req)
 }
 
 
+/*
+ * メインリクエスト処理
+ *
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *
+ * 復帰値
+ *   CI_OK      : 正常
+ *   CI_ERROR   : 異常
+ */
 static int do_request(ci_request_t * req)
 {
     ci_service_xdata_t *srv_xdata = NULL;
     int res, preview_status = 0, auth_status;
     int ret_status = CI_OK; /*By default ret_status is CI_OK, on error must set to CI_ERROR*/
+
     /* ICAPリクエストヘッダ解析 */
     res = parse_header(req);
     if (res != EC_100) {
@@ -1787,7 +1808,8 @@ static int do_request(ci_request_t * req)
         return CI_ERROR;
     }
     assert(req->current_service_mod);
-    /* サービスの追加情報取得 */
+
+    /* サービス拡張オブジェクト取得 */
     srv_xdata = service_data(req->current_service_mod);
     if (!srv_xdata || srv_xdata->status != CI_SERVICE_OK) {
         ci_debug_printf(2, "Service %s not initialized\n", req->current_service_mod->mod_name);
@@ -1818,6 +1840,7 @@ static int do_request(ci_request_t * req)
         }
     }
 
+    /* サービス固有の初期化処理呼び出し */
     if (req->current_service_mod->mod_init_request_data)
         req->service_data =
             req->current_service_mod->mod_init_request_data(req);
@@ -1908,12 +1931,22 @@ static int do_request(ci_request_t * req)
     return ret_status;
 }
 
-/* リクエスト処理メイン */
+/*
+ * リクエスト処理
+ *
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *
+ * 復帰値
+ *   res
+ *   CI_NO_STATUS
+ */
 int process_request(ci_request_t * req)
 {
     int res;
     ci_service_xdata_t *srv_xdata;
-    /* リクエスト処理 */
+
+    /* メインリクエスト処理 */
     res = do_request(req);
 
     /* 未処理リクエストデータあり */
@@ -1926,14 +1959,22 @@ int process_request(ci_request_t * req)
 
     /* 統計情報更新 */
     if (STATS) {
+        /* サービス拡張オブジェクト取得 */
         if (req->return_code != EC_404 && req->current_service_mod)
             srv_xdata = service_data(req->current_service_mod);
         else
             srv_xdata = NULL;
 
+        /*
+         * スレッド間での共有資源アクセスの排他ロック取得
+         * 排他ロックが取得できるまで待機する
+         */
         STATS_LOCK();
+
+        /* 総リクエスト数 */
         if (STAT_REQUESTS >= 0) STATS_INT64_INC(STAT_REQUESTS,1);
 
+        /*  メソッド毎リクエスト数 */
         if (req->type == ICAP_REQMOD) {
             STATS_INT64_INC(STAT_REQMODS, 1);
             if (srv_xdata)
@@ -1956,7 +1997,7 @@ int process_request(ci_request_t * req)
                 STATS_INT64_INC(srv_xdata->stat_allow204, 1);
         }
 
-
+        /* 各種送受信サイズ */
         if (STAT_BYTES_IN >= 0) STATS_KBS_INC(STAT_BYTES_IN, req->bytes_in);
         if (STAT_BYTES_OUT >= 0) STATS_KBS_INC(STAT_BYTES_OUT, req->bytes_out);
         if (STAT_HTTP_BYTES_IN >= 0) STATS_KBS_INC(STAT_HTTP_BYTES_IN, req->http_bytes_in);
@@ -1978,6 +2019,8 @@ int process_request(ci_request_t * req)
             if (srv_xdata->stat_body_bytes_out >= 0)
                 STATS_KBS_INC(srv_xdata->stat_body_bytes_out, req->body_bytes_out);
         }
+
+        /* 排他ロック解除 */
         STATS_UNLOCK();
     }
 
