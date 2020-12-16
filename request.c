@@ -82,7 +82,18 @@ void request_stats_init()
     STAT_BODY_BYTES_OUT = ci_stat_entry_register("BODY BYTES OUT", STAT_KBS_T, "General");
 }
 
-/* ICAPリクエスト受信待ち */
+/*
+ * ICAPリクエスト受信待ち
+ *
+ * 引数
+ *   ci_connection_t  *conn         : コネクションオブジェクト
+ *   int               secs         : 接続待ちタイムアウト時間(s)
+ *   int               what_wait    : 待ち受け対象フラグ（ci_wait_for_read など）
+ *
+ * 復帰値
+ *   >0 : select() 正常時の復帰値
+ *   -1 : 異常（主に select() で異常）
+ */
 static int wait_for_data(ci_connection_t *conn, int secs, int what_wait)
 {
     int wait_status;
@@ -106,9 +117,15 @@ static int wait_for_data(ci_connection_t *conn, int secs, int what_wait)
 }
 
 /*
-  リクエストオブジェクトの生成
-  リクエストの都度呼ばれるわけではない？
-*/
+ * リクエストオブジェクトの生成
+ *
+ * 引数
+ *   ci_connection_t  *connection   : コネクションオブジェクト
+ *
+ * 復帰値
+ *   NULL以外   : 正常
+ *   NULL       : 異常
+ */
 ci_request_t *newrequest(ci_connection_t * connection)
 {
     ci_request_t *req;
@@ -125,12 +142,24 @@ ci_request_t *newrequest(ci_connection_t * connection)
         return NULL;
     }
 
+    /*
+     * 〇 初期化は不要か？
+     * 現状は ci_copy_connection() で ci_connection_t の構造体メンバを
+     * 全て複製しているため問題ない。
+     * が、ci_connection_t のメンバを拡張したときに追加が漏れる事を考慮して
+     * 初期化しておく？
+     */
+    memset(conn, 0, sizeof(struct ci_connection_t));
+
     assert(conn);
     ci_copy_connection(conn, connection);
     /* req の malloc 失敗でNULLリターン */
     req = ci_request_alloc(conn);
     /* ★ NULL チェック追加 */
     if (req == NULL) {
+        free(conn);
+        conn = NULL;
+
         ci_debug_printf(1,
                         "Server Error: Error allocating memory \n");
         return NULL;
@@ -140,6 +169,7 @@ ci_request_t *newrequest(ci_connection_t * connection)
     if ((access = access_check_client(req)) == CI_ACCESS_DENY) { /*Check for client access */
         len = strlen(FORBITTEN_STR);
         ci_connection_write(connection, FORBITTEN_STR, len, TIMEOUT);
+        /* ci_request_destro() では conn, req が free される */
         ci_request_destroy(req);
         return NULL;          /*Or something that means authentication error */
     }
@@ -150,7 +180,17 @@ ci_request_t *newrequest(ci_connection_t * connection)
 }
 
 
-/* リクエストの再利用 */
+/*
+ * リクエストオブジェクトの再利用
+ *
+ * 引数
+ *   ci_request_t     *req          : リクエストオブジェクト
+ *   ci_connection_t  *connection   : コネクションオブジェクト
+ *
+ * 復帰値
+ *   1  : 正常
+ *   0  : 異常
+ */
 int recycle_request(ci_request_t * req, ci_connection_t * connection)
 {
     int access;
@@ -170,7 +210,17 @@ int recycle_request(ci_request_t * req, ci_connection_t * connection)
     return 1;
 }
 
-/* Keep-Alive 処理 */
+/*
+ * Keep-Alive 処理
+ *
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *
+ * 復帰値
+ *   >0 : ICAPリクエスト待ち受け正常
+ *        または、溢れデータあり(1)
+ *   -1 : ICAPリクエスト待ち受け異常
+ */
 int keepalive_request(ci_request_t *req)
 {
     /* Preserve extra read bytes*/
@@ -200,6 +250,19 @@ int keepalive_request(ci_request_t *req)
 #define ICAP_HEADER_READSIZE 512
 
 /*this function check if there is enough space in buffer buf ....*/
+/*
+ * リクエストヘッダ領域バッファのサイズ再割り当て
+ *
+ * 引数
+ *   char  **buf        : バッファ領域
+ *   int    *size       : 現在のバッファサイズ
+ *   int     used       : 使用済みバッファサイズ
+ *   int     mustadded  : 確保が必要なバッファサイズ
+ *
+ * 復帰値
+ *   EC_100 : 正常
+ *   EC_500 : 異常
+ */
 static int icap_header_check_realloc(char **buf, int *size, int used, int mustadded)
 {
     char *newbuf;
@@ -220,9 +283,13 @@ static int icap_header_check_realloc(char **buf, int *size, int used, int mustad
 /*
  * ICAPリクエストヘッダの受信処理
  *
- * ci_request_t       *req      : リクエストオブジェクト
- * ci_headers_list_t  *h        : バッファリスト
- * int                 timeout  : 接続タイムアウト
+ * 引数
+ *   ci_request_t       *req        : リクエストオブジェクト
+ *   ci_headers_list_t  *h          : バッファリスト
+ *   int                 timeout    : 接続タイムアウト
+ *
+ * 復帰値
+ *   EC_XXX
  */
 static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int timeout)
 {
@@ -309,15 +376,22 @@ static int ci_read_icap_header(ci_request_t * req, ci_headers_list_t * h, int ti
 /*
  * カプセル化ヘッダ（HTTPリクエストヘッダ or HTTPレスポンスヘッダ）受信処理
  *
- * ci_request_t       *req  : リクエストオブジェクト
- * ci_headers_list_t  *h    : バッファリスト
- * int                 size : Encapsulatedヘッダで通知されたカプセル化ヘッダサイズ
+ * 引数
+ *   ci_request_t       *req    : リクエストオブジェクト
+ *   ci_headers_list_t  *h      : バッファリスト
+ *   int                 size   : Encapsulatedヘッダで通知されたカプセル化ヘッダサイズ
+ *
+ * 復帰値
+ *   EC_100
+ *   EC_500     : 処理異常
+ *   CI_ERROR   : データ受信異常
  */
 static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int size)
 {
     int bytes = 0, remains, readed = 0;
     char *buf_end = NULL;
 
+    /* 受信データ格納バッファ割り当て */
     if (!ci_headers_setsize(h, size + (CHECK_FOR_BUGGY_CLIENT != 0 ? 2 : 0)))
         return EC_500;
     buf_end = h->buf;
@@ -358,6 +432,8 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
     } else if (CHECK_FOR_BUGGY_CLIENT && strncmp(buf_end - 2, "\r\n", 2) != 0) {
         // Some icap clients missing the "\r\n\r\n" after end of headers
         // when null-body is present.
+        /* null-body の場合にカプセル化ヘッダ区切り文字を送らないICAPクライアントを考慮 */
+        ci_debug_printf(6, "Missing the CRLF after end of headers \n");
         *buf_end = '\r';
         *(buf_end + 1) = '\n';
         h->bufused += 2;
@@ -369,7 +445,17 @@ static int read_encaps_header(ci_request_t * req, ci_headers_list_t * h, int siz
 }
 
 /*
- * ICAP メソッド取得
+ * ICAPメソッド判定
+ *
+ * 引数
+ *   char   *buf    : リクエストラインバッファ
+ *   char  **end    : バッファのメソッド末尾位置
+ *
+ * 復帰値
+ *   ICAP_OPTIONS   : OPTIONS
+ *   ICAP_REQMOD    : REQMOD
+ *   ICAP_RESPMOD   : RESPMOD
+ *   -1             : 不明メソッド
  */
 static int get_method(char *buf, char **end)
 {
@@ -391,8 +477,12 @@ static int get_method(char *buf, char **end)
 /*
  * ICAPリクエストライン解析処理
  *
- * ci_request_t  *req   : リクエストオブジェクト
- * char          *buf   : リクエストラインバッファ
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *   char          *buf : リクエストラインバッファ
+ *
+ * 復帰値
+ *   EC_XXX
  */
 static int parse_request(ci_request_t * req, char *buf)
 {
@@ -446,7 +536,6 @@ static int parse_request(ci_request_t * req, char *buf)
             /* クエリパラメタ検査 */
             start = ++end;
             if ((end = strchr(start, ' ')) != NULL) {
-                /* この時点での req->args には設定で定義されたパラメタが入っている？ */
                 args_len = strlen(req->args);
                 len = end - start;
                 if (args_len && len) {
@@ -506,6 +595,7 @@ static int parse_request(ci_request_t * req, char *buf)
      * 既定サービス名は DefaultService で設定する（未設定時はNULL）
      */
     if (req->service[0] == '\0' && DEFAULT_SERVICE) { /*No service name defined*/
+        /* バッファオーバーフローは考慮済み */
         strncpy(req->service, DEFAULT_SERVICE, MAX_SERVICE_NAME);
     }
 
@@ -537,7 +627,12 @@ static int parse_request(ci_request_t * req, char *buf)
 /*
  * ICAPリクエスト Encapsulatedヘッダ書式検査
  *
- * ci_request_t  *req   : リクエストオブジェクト
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *
+ * 復帰値
+ *   EC_100 : 書式検査ＯＫ
+ *   EC_400 : 書式検査ＮＧ
  */
 static int check_request(ci_request_t *req)
 {
@@ -631,7 +726,12 @@ static int check_request(ci_request_t *req)
 /*
  * ICAPリクエストヘッダ解析処理
  *
- * ci_request_t  *req   : リクエストオブジェクト
+ * 引数
+ *   ci_request_t  *req : リクエストオブジェクト
+ *
+ * 復帰値
+ *   EC_100 : 書式検査ＯＫ
+ *   EC_400 : 書式検査ＮＧ
  */
 static int parse_header(ci_request_t * req)
 {
@@ -916,6 +1016,7 @@ static int mk_responce_header(ci_request_t * req)
              (req->current_service_mod->mod_short_descr ? req->
               current_service_mod->mod_short_descr : req->current_service_mod->
               mod_name));
+    buf[511] = '\0';
     /*Here we must append it to an existsing Via header not just add a new header */
     /*
      * ICAPリクエストされたHTTPヘッダにViaヘッダが存在する場合
